@@ -65,11 +65,11 @@ def integrate_bvbrc_gtdb_data(local_gtdb_dir):
     total_lines = 0
     num_matches = 0
     for metadata_file in ["bac120_metadata.tsv.gz", "ar53_metadata.tsv.gz"]:
-        header = F.readline().rstrip().split("\t")
-        if not (header[0] == 'accession' and header[15] == 'gtdb_representative' and header[54] == 'ncbi_genbank_assembly_accession' and header[16] == 'gtdb_taxonomy'):
-            raise Exception("headers not as expected")
         with gzip.open(metadata_file, "rt") as F:
             print("reading "+metadata_file)
+            header = F.readline().rstrip().split("\t")
+            if not (header[0] == 'accession' and header[17] == 'gtdb_genome_representative' and header[57] == 'ncbi_genbank_assembly_accession'):
+                raise Exception("headers not as expected")
             for line in F:
                 total_lines += 1
                 fields = line.rstrip().split("\t")
@@ -89,10 +89,10 @@ def integrate_bvbrc_gtdb_data(local_gtdb_dir):
 
     bvbrc_gtdb = {}
     gtdb_bvbrc = {}
-    bvbrc_species = {}
+    division = {}
     num_matches = 0
     total_lines = 0
-    cmd_base = "p3-all-genomes -r assembly_accession -a assembly_accession,species -e superkingdom,"
+    cmd_base = "p3-all-genomes -r assembly_accession -a assembly_accession -e superkingdom,"
     for div in ['Bacteria', 'Archaea']:
         print(f"run {cmd_base}{div}")
         i = 0
@@ -104,35 +104,35 @@ def integrate_bvbrc_gtdb_data(local_gtdb_dir):
             bvbrc_id = fields[0]
             if len(fields) > 1:
                 assembly = fields[1]
-            if len(fields) > 2:
-                species = fields[2]
-
-            if total_lines < 3:
+                if assembly in assembly_gtdb:
+                    gtdb_id = assembly_gtdb[assembly]
+                    bvbrc_gtdb[bvbrc_id] = gtdb_id
+                    gtdb_bvbrc[gtdb_id] = bvbrc_id
+                    division[bvbrc_id] = div
+                    num_matches += 1
+                    if num_matches < 4:
+                        print(f"got match, {bvbrc_id}\t{gtdb_id}\t{assembly}")
+            else:
                 print("line = "+line)
-                print(f"bi={bvbrc_id}\tas={assembly}\tsp={species}")
-            if assembly in assembly_gtdb:
-                gtdb_id = assembly_gtdb[assembly]
-                bvbrc_gtdb[bvbrc_id] = gtdb_id
-                gtdb_bvbrc[gtdb_id] = bvbrc_id
-                bvbrc_species[bvbrc_id] = species
-                num_matches += 1
-                if num_matches < 6:
-                    print(f"got match, {bvbrc_id}\t{gtdb_id}\t{assembly}")
+                print(f"bi={bvbrc_id}\tas={assembly}")
 
-    cmd = "cut -f 1 bvbrc_gtdb_ids.tsv | p3-get-genome-data -a genome_name,taxonomy > bvbrc_name_taxonomy.tsv"
+    with open("bvbrc_gtdb_ids.tsv", "w") as F:
+        F.write("bvbrc_id\tgtdb_id\tdivision\n")
+        for bvbrc_id in sorted(bvbrc_gtdb):
+            gtdb_id = bvbrc_gtdb[bvbrc_id]
+            F.write(f"{bvbrc_id}\t{gtdb_id}\t{division[bvbrc_id]}\n")
+        F.close()
+
+    cmd = "cut -f 1 bvbrc_gtdb_ids.tsv | p3-get-genome-data -a taxon_lineage_ids > bvbrc_taxonomy.tsv"
+    print("run "+cmd)
     subprocess.run(cmd, shell=True)
     print(f"number of matches = {num_matches}")
 
-    with open("bvbrc_gtdb_ids.tsv", "w") as F:
-        F.write("bvbrc_id\tgtdb_id\tbvbrc_species\tgtdb_species\n")
-        for bvbrc_id in sorted(bvbrc_gtdb):
-            gtdb_id = bvbrc_gtdb[bvbrc_id]
-            F.write(f"{bvbrc_id}\t{gtdb_id}\t{bvbrc_species[bvbrc_id]}\t{gtdb_species[gtdb_id]}\n")
     os.chdir(cur_dir)
 
 def test_data_integrity(data_dir):
     result = True
-    needed_files = ['bac120.tree', 'ar53.tree', 'bac120_metadata.tsv.gz', 'ar53_metadata.tsv.gz', 'VERSION.txt', 'bvbrc_gtdb_ids.tsv', 'bvbrc_name_taxonomy.tsv']
+    needed_files = ['bac120.tree', 'ar53.tree', 'bac120_metadata.tsv.gz', 'ar53_metadata.tsv.gz', 'VERSION.txt', 'bvbrc_gtdb_ids.tsv', 'bvbrc_taxonomy.tsv']
     for f in needed_files:
         if not os.path.isfile(f"{data_dir}/{f}"):
             result = False
@@ -142,51 +142,63 @@ def test_data_integrity(data_dir):
 
 def read_gtdb_bvbrc(data_dir):
     gtdb_bvbrc = {}
+    bvbrc_division = {}
     with open(data_dir+"/bvbrc_gtdb_ids.tsv") as F:
         for line in F:
             fields = line.rstrip().split("\t")
             bvbrc_id = fields[0]
             gtdb_id = fields[1]
+            division = fields[2]
             gtdb_bvbrc[gtdb_id] = bvbrc_id
-    return gtdb_bvbrc
+            bvbrc_division[bvbrc_id] = division
+    return gtdb_bvbrc, bvbrc_division
 
 def read_bvbrc_taxonomy(data_dir):
-    taxon_division = {}
     taxon_genomes = {}
-    genome_name = {}
-    with open(data_dir+"/bvbrc_name_taxonomy.tsv") as F:
+    taxon_level = {}
+    taxon_division = {}
+    with open(data_dir+"/bvbrc_taxonomy.tsv") as F:
         header = F.readline()
         for line in F:
-            genome_id, name, taxonomy = line.rstrip().split("\t")
-            genome_name[genome_id] = name
-            taxa = taxonomy.split("; ")
-            division = taxa[1]
-            for taxon in taxa[2:]:
-                taxon_division[taxon] = division
+            genome_id, taxonomy = line.rstrip().split("\t")
+            taxa = taxonomy.split("::")
+            for level, taxon in enumerate(taxa):
+                if level < 4:
+                    continue
                 if not taxon in taxon_genomes:
                     taxon_genomes[taxon] = set()
+                    taxon_level[taxon] = level
+                    taxon_division[taxon] = taxa[1] # 2=Bacteria, 2157=Archea
                 taxon_genomes[taxon].add(genome_id)
-    return(taxon_division, taxon_genomes, genome_name)
+    return(taxon_genomes, taxon_division, taxon_level)
 
 def read_gtdb_tree(tree_file, gtdb_bvbrc_map):
+    print(f"read tree file: {tree_file}")
     tree = None
     tree = dendropy.Tree.get(path=tree_file, schema='newick')
     num_tips = 0
     num_replacements = 0
+    bvbrc_tip_labels = set()
     for leaf in tree.leaf_nodes():
         num_tips += 1
         gtdb_id = leaf.taxon.label.replace(' ', '_') # undo modification done by dendropy
         # Check if the current label is in the map
         if gtdb_id in gtdb_bvbrc_map:
             leaf.taxon.label = gtdb_bvbrc_map[gtdb_id]
+            leaf.label = gtdb_bvbrc_map[gtdb_id]
+            #print("set label to "+leaf.label)
+            bvbrc_tip_labels.add(leaf.label)
             num_replacements += 1
             # It may also be useful to update the node label itself if it's used
             # leaf.label = label_map[leaf.label]
     print("read gtdb tree from {tree_file}\n\tnum tips = {num_tips}\n\tnum_replacements = {num_replacements}")
-    return tree
+    return tree, bvbrc_tip_labels
 
-def extract_subtree(tree, tip_ids, num_outgroups_per_ancestral_node=2, num_ancestral_nodes=2, target_tree_size=40):
+def extract_subtree(tree, tip_ids, genome_priority=None, num_outgroups_per_ancestral_node=2, num_ancestral_nodes=2, target_tree_size=0):
     # use dendropy
+    #for tip in tip_ids:
+    #    node = tree.find_node_with_label(tip)
+    #    print(f"find node with label {tip} yields {node}")
     mrca = tree.mrca(taxon_labels = tip_ids)
     print("found mrca: {}".format(mrca.taxon))
     rep_outgroups = set()
@@ -204,15 +216,16 @@ def extract_subtree(tree, tip_ids, num_outgroups_per_ancestral_node=2, num_ances
                 desc_nodes = child.leaf_nodes()
                 #print("child not anc, num leafs={}".format(len(desc_nodes)))
                 for node in desc_nodes:
-                    if node.taxon.label in gtdb_bvbrc:
-                        bvbrc_id = gtdb_bvbrc[node.taxon.label]
-                        if bvbrc_id in bvbrc_representative:
+                    bvbrc_id = node.taxon.label
+                    if genome_priority and bvbrc_id in genome_priority:
+                        if genome_priority[bvbrc_id] > 0:
                             potential_rep_outgroups.add(node.taxon.label)
+                        elif genome_priority[bvbrc_id] < 0:
+                            less_good_outgroups.add(node.taxon.label)
                         else:
-                            if re.search("sp\.|uncultured|bacterium", bvbrc_name[bvbrc_id]):
-                                less_good_outgroups.add(node.taxon.label)
-                            else:
-                                potential_other_outgroups.add(node.taxon.label)
+                            potential_other_outgroups.add(node.taxon.label)
+                    else:
+                        potential_other_outgroups.add(node.taxon.label)
                     #print("adding pot out {}".format(node.taxon.label))
         for i, label in enumerate(potential_rep_outgroups):
             rep_outgroups.add(label)
@@ -234,7 +247,7 @@ def extract_subtree(tree, tip_ids, num_outgroups_per_ancestral_node=2, num_ances
         tip_ids.add(label)
 
     sys.stderr.write("after adding outgroups, num tips is {}, target size ={} \n".format(len(tip_ids), target_tree_size))
-    if len(tip_ids) < target_tree_size: # try to fill out tree with additional members to get to target size
+    if target_tree_size and (len(tip_ids) < target_tree_size): # try to fill out tree with additional members to get to target size
         sys.stderr.write(f"add additional members from mrca of representative members\n")
         for node in mrca.leaf_nodes():
             label = node.taxon.label
@@ -249,12 +262,12 @@ def extract_subtree(tree, tip_ids, num_outgroups_per_ancestral_node=2, num_ances
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Exctract the subtree from the large GTDB phylogeny corresponding to NCBI taxa.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("download_latest_gtdb_release", action='store-true', help="Look online for GTDB latest release and download trees and metadata to 'gtdb_release_XXX'")
-    parser.add_argument("link_bvbrc_gtdb_ids", action="store-true", help="given GTDB metadata, use Genbank accession ID to link to BVBRC genome IDs")
+    print("about to parse arguments")
+    parser = argparse.ArgumentParser(description="Exctract the subtree from the large GTDB phylogeny corresponding to NCBI taxa.", formatter_class=argparse.ArgumentDefaultsHelpFormatter) 
+    parser.add_argument("--download_latest_gtdb_release", action='store_true', help="Look online for GTDB latest release and download trees and metadata to 'gtdb_release_XXX'")
+    parser.add_argument("--link_bvbrc_gtdb_ids", action="store_true", help="given GTDB metadata, use Genbank accession ID to link to BVBRC genome IDs")
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("--gtdb_data_dir", metavar="directory", type=str, help="Optional, searches for latest version: gtdb_release_XXX")
-    #parser.add_argument("--gtdb_to_bvbrc_ids", metavar="file", type=str, help="File with GTDB_id [tab] bvbrc_id.")
-    #parser.add_argument("--bvbrc_name_quality_reference_taxon", metavar="file", type=str, help="File with bvbrc_id, name, quality and wether a reference.")
     parser.add_argument("--division", metavar="bacteria|archaea", choices = ['bacteria', 'archaea'], type=str, default="bacteria", help="Analyze Bacteria or Archaea.")
     parser.add_argument("--rank", metavar="genus|family|order|class", choices = ['genus', 'family', 'order', 'class'], type=str, default="order", help="Extract trees for all taxa of this rank.")
     parser.add_argument("--taxon", metavar="name", type=str, help="Single taxon to extract tree for (must match rank).")
@@ -263,6 +276,7 @@ def main():
     parser.add_argument("--outgroups_per_anc_node", metavar="NUM", type=int, default=2,help="How many outgroup tips to select from each ancestral node.")
 
     args = parser.parse_args()
+    print(f"parsed args: args=\n{args}")
     #starttime = time()
 
     if args.download_latest_gtdb_release:
@@ -281,22 +295,37 @@ def main():
         if not args.gtdb_data_dir:
             raise Exception("No gtdb release directory found (perhaps run with --download_latest_gtdb_release)")
 
+    if args.link_bvbrc_gtdb_ids:
+        integrate_bvbrc_gtdb_data(args.gtdb_data_dir)
+
     test_data_integrity(args.gtdb_data_dir)
 
-    gtdb_bvbrc = read_gtdb_bvbrc(args.gtdb_data_dir)
-    taxon_division, taxon_genomes, genome_name = read_bvbrc_taxonomy(args.gtdb_data_dir)
+    gtdb_bvbrc, genome_division = read_gtdb_bvbrc(args.gtdb_data_dir)
+    taxon_genomes, taxon_division, taxon_level = read_bvbrc_taxonomy(args.gtdb_data_dir)
 
     division_tree = {}
-    division_to_tree_file = {"Bacteria": 'bac120.tree', "Archaea": 'ar53.tree'}
+    division_genomes = {}
+    division_tree_file = {"Bacteria": 'bac120.tree', "Archaea": 'ar53.tree', '2': 'bac120.tree', '2157': 'ar53.tree'}
+    taxon_list = []
     if args.taxon:
-        taxon = args.taxon
+        taxon_list.append(args.taxon)
+
+    for taxon in taxon_list:
         division = taxon_division[taxon]
         if not division in division_tree:
-            tree_file = args.gtdb_data_dir + "/" + division_to_tree_file[division]
-            division_tree[division] = read_gtdb_tree(tree_file, gtdb_bvbrc)
-        extract_subtree(division_tree[division], taxon_genomes[taxon])
-    #    subtree.write(file=SUBTREE_OUT, schema="newick", suppress_rooting=True)
+            tree_file = args.gtdb_data_dir + "/" + division_tree_file[division]
+            division_tree[division], division_genomes[division] = read_gtdb_tree(tree_file, gtdb_bvbrc)
+        tree = division_tree[division]
+        available_tree_tips = taxon_genomes[taxon] & division_genomes[division]
+        if len(available_tree_tips) < len(taxon_genomes[taxon]):
+            print(f"for taxon{taxon} only {len(available_tree_tips)} of {len(taxon_genomes[taxon])} tips available")
+        subtree = extract_subtree(tree, available_tree_tips,num_outgroups_per_ancestral_node=args.outgroups_per_anc_node, num_ancestral_nodes=args.num_ancestral_nodes)
+        tree_file = f"taxon_{taxon}_gtdb_subtree_og{args.num_ancestral_nodes}x{args.outgroups_per_anc_node}.nwk"
+        with open(tree_file, 'w') as F:
+            subtree.write(file=F, schema="newick", suppress_rooting=True)
 
+if __name__ == "__main__":
+    main()
 
 """
     assembly_gtdb = {}
