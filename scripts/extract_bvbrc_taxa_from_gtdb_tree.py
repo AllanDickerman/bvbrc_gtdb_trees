@@ -172,6 +172,59 @@ def read_bvbrc_taxonomy(data_dir):
                 taxon_genomes[taxon].add(genome_id)
     return(taxon_genomes, taxon_division, taxon_level)
 
+def get_taxon_name_rank(taxon_set):
+    get_taxonomy_data_cmd = "p3-get-taxonomy-data -a taxon_name,taxon_rank"
+    taxon_name = {}
+    taxon_rank = {}
+    taxon_list = list(taxon_set)
+    stride = 300
+    start = 0
+    while start < len(taxon_list):
+        sublist = taxon_list[start : start+stride]
+        print(f"get range {start}: {start+stride}")
+        start += stride
+        proc = subprocess.Popen(get_taxonomy_data_cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        #for taxon in taxon_set:
+        proc.stdin.write("\n".join(sublist)+"\n")
+        proc.stdin.close()
+        proc.wait()
+        for line in proc.stdout:
+            (taxon_id, name, rank) = line.rstrip().split("\t")
+            taxon_name[taxon_id] = name
+            taxon_rank[taxon_id] = rank
+            #print(f"tid:{taxon_id}, n:{name}, r:{rank}")
+    return taxon_name, taxon_rank
+
+def filter_taxon_name(taxon_name, valid_taxon_set=None):
+    if not valid_taxon_set:
+        valid_taxon_set = set(taxon_name.keys())
+    for taxon_id in taxon_name:
+        name = taxon_name[taxon_id]
+        if re.match("environmental", name):
+            valid_taxon_set.discard(taxon_id)
+        elif re.match("unclassified", name):
+            valid_taxon_set.discard(taxon_id)
+        elif re.match("uncultured", name):
+            valid_taxon_set.discard(taxon_id)
+    return valid_taxon_set
+
+def filter_taxon_rank(taxon_rank, allowed_ranks, valid_taxon_set=None):
+    if not valid_taxon_set:
+        valid_taxon_set = set(taxon_name.keys())
+    for taxon_id in taxon_rank:
+        if not taxon_rank[taxon_id] in allowed_ranks:
+            valid_taxon_set.discard(taxon_id)
+    return valid_taxon_set
+
+def filter_taxon_size(taxon_genomes, valid_taxon_set=None, min_size=0, max_size=1000000):
+    if not valid_taxon_set:
+        valid_taxon_set = set(taxon_genomes.keys())
+    for taxon_id in taxon_genomes:
+        num_genomes = len(taxon_genomes[taxon_id])
+        if (num_genomes < min_size) | (num_genomes > max_size):
+            valid_taxon_set.discard(taxon_id)
+    return valid_taxon_set
+
 def read_gtdb_tree(tree_file, gtdb_bvbrc_map):
     print(f"read tree file: {tree_file}")
     tree = None
@@ -262,17 +315,22 @@ def extract_subtree(tree, tip_ids, genome_priority=None, num_outgroups_per_ances
 
 
 def main():
-    print("about to parse arguments")
-    parser = argparse.ArgumentParser(description="Exctract the subtree from the large GTDB phylogeny corresponding to NCBI taxa.", formatter_class=argparse.ArgumentDefaultsHelpFormatter) 
+    print("parse arguments")
+    parser = argparse.ArgumentParser(description="Exctract from the large GTDB phylogeny subtrees corresponding to NCBI taxa.", formatter_class=argparse.ArgumentDefaultsHelpFormatter) 
     parser.add_argument("--download_latest_gtdb_release", action='store_true', help="Look online for GTDB latest release and download trees and metadata to 'gtdb_release_XXX'")
     parser.add_argument("--link_bvbrc_gtdb_ids", action="store_true", help="given GTDB metadata, use Genbank accession ID to link to BVBRC genome IDs")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--gtdb_data_dir", metavar="directory", type=str, help="Optional, searches for latest version: gtdb_release_XXX")
-    parser.add_argument("--division", metavar="bacteria|archaea", choices = ['bacteria', 'archaea'], type=str, default="bacteria", help="Analyze Bacteria or Archaea.")
-    parser.add_argument("--rank", metavar="genus|family|order|class", choices = ['genus', 'family', 'order', 'class'], type=str, default="order", help="Extract trees for all taxa of this rank.")
-    parser.add_argument("--taxon", metavar="name", type=str, help="Single taxon to extract tree for (must match rank).")
-    parser.add_argument("--target_tree_size", metavar="NUM", type=int, default=20, help="Target number of tips on tree.")
-    parser.add_argument("--num_ancestral_nodes", metavar="NUM", type=int, default=3, help="How many nodes to step down to find outgroups.")
+    #parser.add_argument("--division", metavar="bacteria|archaea", choices = ['bacteria', 'archaea'], type=str, default="bacteria", help="Analyze Bacteria or Archaea.")
+    #parser.add_argument("--rank", metavar="genus|family|order|class", choices = ['genus', 'family', 'order', 'class'], type=str, default="order", help="Extract trees for all taxa of this rank.")
+    parser.add_argument("--taxon", metavar="NNNN", type=int, help="Single taxon to extract.")
+    parser.add_argument("--taxon_set_file", metavar="file", type=str, help="File with list of taxon IDs for extraction.")
+    parser.add_argument("--target_ranks", metavar="rank1,rank2", type=str, default='genus,family,order,class,phylum' help="Comma-separated list of ranks to extract.")
+    #parser.add_argument("--all_taxa", action='store_true', help="Generate trees for all taxa
+    #parser.add_argument("--target_tree_size", metavar="NUM", type=int, default=20, help="Target number of tips on tree.")
+    parser.add_argument("--min_taxon_size", metavar="NUM", type=int, default=10, help="Minimum size of taxon.")
+    parser.add_argument("--max_taxon_size", metavar="NUM", type=int, default=1000, help="Maximum size of taxon.")
+    parser.add_argument("--num_ancestral_nodes", metavar="NUM", type=int, default=2, help="How many nodes to step down to find outgroups.")
     parser.add_argument("--outgroups_per_anc_node", metavar="NUM", type=int, default=2,help="How many outgroup tips to select from each ancestral node.")
 
     args = parser.parse_args()
@@ -306,11 +364,33 @@ def main():
     division_tree = {}
     division_genomes = {}
     division_tree_file = {"Bacteria": 'bac120.tree', "Archaea": 'ar53.tree', '2': 'bac120.tree', '2157': 'ar53.tree'}
-    taxon_list = []
+    taxon_set = set()
     if args.taxon:
-        taxon_list.append(args.taxon)
+        taxon_set.add(args.taxon)
+    if args.taxon_set_file:
+        print("reading taxa IDs from "+args.taxon_set_file)
+        with open(args.taxon_set_file) as F:
+            for line in F:
+                taxon_id = line.split()[0]
+                m = re.match('\d+$', taxon_id)
+                taxon_set.add(taxon_id)
 
-    for taxon in taxon_list:
+    print(f"after reading input sets: num in taxon_set = {len(taxon_set)}")
+    if len(taxon_set) == 0:
+        taxon_set = set(taxon_genomes.keys())
+        print(f"after adding all taxa, num in taxon_set = {len(taxon_set)}")
+
+    taxon_set = filter_taxon_size(taxon_genomes, taxon_set, min_size=9, max_size=13)
+    print(f"after filter taxon size: num in taxon_set = {len(taxon_set)}")
+    taxon_name, taxon_rank = get_taxon_name_rank(taxon_set)
+    taxon_set = filter_taxon_name(taxon_name, taxon_set)
+    taxon_set = filter_taxon_rank(taxon_rank, args.target_ranks, taxon_set)
+    print(f"after filter taxon name: num in taxon_set = {len(taxon_set)}")
+
+    newick_directory = args.gtdb_data_dir + "/newick_trees"
+    if not os.path.exists(newick_directory):
+        os.mkdir(newick_directory)
+    for taxon in taxon_set:
         division = taxon_division[taxon]
         if not division in division_tree:
             tree_file = args.gtdb_data_dir + "/" + division_tree_file[division]
@@ -320,7 +400,7 @@ def main():
         if len(available_tree_tips) < len(taxon_genomes[taxon]):
             print(f"for taxon{taxon} only {len(available_tree_tips)} of {len(taxon_genomes[taxon])} tips available")
         subtree = extract_subtree(tree, available_tree_tips,num_outgroups_per_ancestral_node=args.outgroups_per_anc_node, num_ancestral_nodes=args.num_ancestral_nodes)
-        tree_file = f"taxon_{taxon}_gtdb_subtree_og{args.num_ancestral_nodes}x{args.outgroups_per_anc_node}.nwk"
+        tree_file = f"{newick_directory}/taxon_{taxon}_gtdb_subtree_og{args.num_ancestral_nodes}x{args.outgroups_per_anc_node}.nwk"
         with open(tree_file, 'w') as F:
             subtree.write(file=F, schema="newick", suppress_rooting=True)
 
