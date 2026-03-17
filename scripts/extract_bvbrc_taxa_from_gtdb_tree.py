@@ -4,9 +4,11 @@ import os
 import os.path
 import gzip
 import glob
+import shutil
 import argparse
 import subprocess
 import requests
+import json
 import dendropy
 
 num_ancestral_nodes = 3 # number of nodes to step down to find outgroups
@@ -15,6 +17,7 @@ inclusive_from_mrca = False
 
 gtdb_base_url = "https://data.gtdb.aau.ecogenomic.org/"
 gtdb_base_url = "https://data.ace.uq.edu.au/public/gtdb/data/"
+bvbrc_base_url="https://www.bv-brc.org/api-internal/";
 
 def download_file(url):
     #https://stackoverflow.com/questions/16694907/download-a-large-file-in-python-with-requests
@@ -157,20 +160,27 @@ def read_bvbrc_taxonomy(data_dir):
     taxon_genomes = {}
     taxon_level = {}
     taxon_division = {}
+    taxon_subtaxa = {}
+    taxon_parent = {}
     with open(data_dir+"/bvbrc_taxonomy.tsv") as F:
         header = F.readline()
         for line in F:
             genome_id, taxonomy = line.rstrip().split("\t")
             taxa = taxonomy.split("::")
             for level, taxon in enumerate(taxa):
-                if level < 4:
-                    continue
+                #if level < 4:
+                #    continue
                 if not taxon in taxon_genomes:
                     taxon_genomes[taxon] = set()
                     taxon_level[taxon] = level
-                    taxon_division[taxon] = taxa[1] # 2=Bacteria, 2157=Archea
+                    #taxon_division[taxon] = taxa[1] # 2=Bacteria, 2157=Archea
+                    taxon_subtaxa[taxon] = set()
                 taxon_genomes[taxon].add(genome_id)
-    return(taxon_genomes, taxon_division, taxon_level)
+                if (level+1) < len(taxa):
+                    taxon_parent[taxa[level+1]] = taxon
+                    for level2 in range(level+1, len(taxa)):
+                        taxon_subtaxa[taxon].add(taxa[level2])
+    return(taxon_genomes, taxon_subtaxa, taxon_parent)
 
 def get_taxon_name_rank(taxon_set):
     get_taxonomy_data_cmd = "p3-get-taxonomy-data -a taxon_name,taxon_rank"
@@ -195,6 +205,31 @@ def get_taxon_name_rank(taxon_set):
             #print(f"tid:{taxon_id}, n:{name}, r:{rank}")
     return taxon_name, taxon_rank
 
+def get_id_from_taxon_name(taxon_name):
+    Session = requests.Session()
+    Session.headers.update({ 'accept': "application/json" })
+    Session.headers.update({ "Content-Type": "application/rqlquery+x-www-form-urlencoded" })
+
+    query = f"eq(taxon_name,{taxon_name})"
+    query += "&select(taxon_id,taxon_name)"
+    query += "&limit(100000)"
+    response = Session.get(bvbrc_base_url+"taxonomy", params=query)
+    print(response.url+"\n")
+    print(f"response={response}\n")
+    retval = ''
+    numrows = 0
+    for record in response.json():
+        numrows += 1
+        if record['taxon_name'] == taxon_name:
+            print(f"{record['taxon_id']}\t{record['taxon_name']}")
+            retval = record['taxon_id']
+            break
+    print(f"numrows = {numrows}")
+    print("returning: "+retval)
+    return(retval)
+
+    
+
 def filter_taxon_name(taxon_name, valid_taxon_set=None):
     if not valid_taxon_set:
         valid_taxon_set = set(taxon_name.keys())
@@ -210,18 +245,23 @@ def filter_taxon_name(taxon_name, valid_taxon_set=None):
 
 def filter_taxon_rank(taxon_rank, allowed_ranks, valid_taxon_set=None):
     if not valid_taxon_set:
-        valid_taxon_set = set(taxon_name.keys())
+        valid_taxon_set = set(taxon_rank.keys())
     for taxon_id in taxon_rank:
         if not taxon_rank[taxon_id] in allowed_ranks:
             valid_taxon_set.discard(taxon_id)
     return valid_taxon_set
 
 def filter_taxon_size(taxon_genomes, valid_taxon_set=None, min_size=0, max_size=1000000):
+    if max_size < min_size:
+        raise Exception(f"max_size {max_size} < min_size {min_size}")
     if not valid_taxon_set:
         valid_taxon_set = set(taxon_genomes.keys())
     for taxon_id in taxon_genomes:
         num_genomes = len(taxon_genomes[taxon_id])
-        if (num_genomes < min_size) | (num_genomes > max_size):
+        valid = num_genomes >= min_size
+        if max_size:
+            valid &= (num_genomes <= max_size)
+        if not valid:
             valid_taxon_set.discard(taxon_id)
     return valid_taxon_set
 
@@ -229,6 +269,7 @@ def read_gtdb_tree(tree_file, gtdb_bvbrc_map):
     print(f"read tree file: {tree_file}")
     tree = None
     tree = dendropy.Tree.get(path=tree_file, schema='newick')
+    tree.is_rooted = True
     num_tips = 0
     num_replacements = 0
     bvbrc_tip_labels = set()
@@ -244,7 +285,7 @@ def read_gtdb_tree(tree_file, gtdb_bvbrc_map):
             num_replacements += 1
             # It may also be useful to update the node label itself if it's used
             # leaf.label = label_map[leaf.label]
-    print("read gtdb tree from {tree_file}\n\tnum tips = {num_tips}\n\tnum_replacements = {num_replacements}")
+    print(f"    gtdb tree from {tree_file}\n\tnum tips = {num_tips}\n\tnum_replacements = {num_replacements}")
     return tree, bvbrc_tip_labels
 
 def extract_subtree(tree, tip_ids, genome_priority=None, num_outgroups_per_ancestral_node=2, num_ancestral_nodes=2, target_tree_size=0):
@@ -253,7 +294,7 @@ def extract_subtree(tree, tip_ids, genome_priority=None, num_outgroups_per_ances
     #    node = tree.find_node_with_label(tip)
     #    print(f"find node with label {tip} yields {node}")
     mrca = tree.mrca(taxon_labels = tip_ids)
-    print("found mrca: {}".format(mrca.taxon))
+    print(f"found mrca: {mrca}")
     rep_outgroups = set()
     other_outgroups = set()
     cur_anc = mrca
@@ -299,7 +340,7 @@ def extract_subtree(tree, tip_ids, genome_priority=None, num_outgroups_per_ances
             break
         tip_ids.add(label)
 
-    sys.stderr.write("after adding outgroups, num tips is {}, target size ={} \n".format(len(tip_ids), target_tree_size))
+    sys.stderr.write("after adding outgroups, num tips is {}\n".format(len(tip_ids)))
     if target_tree_size and (len(tip_ids) < target_tree_size): # try to fill out tree with additional members to get to target size
         sys.stderr.write(f"add additional members from mrca of representative members\n")
         for node in mrca.leaf_nodes():
@@ -318,18 +359,19 @@ def main():
     print("parse arguments")
     parser = argparse.ArgumentParser(description="Exctract from the large GTDB phylogeny subtrees corresponding to NCBI taxa.", formatter_class=argparse.ArgumentDefaultsHelpFormatter) 
     parser.add_argument("--download_latest_gtdb_release", action='store_true', help="Look online for GTDB latest release and download trees and metadata to 'gtdb_release_XXX'")
+    parser.add_argument("--gtdb_data_url", metavar="URL", type=str, default=gtdb_base_url,  help="URL for top of data, must contain 'releases' folder.")
     parser.add_argument("--link_bvbrc_gtdb_ids", action="store_true", help="given GTDB metadata, use Genbank accession ID to link to BVBRC genome IDs")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--gtdb_data_dir", metavar="directory", type=str, help="Optional, searches for latest version: gtdb_release_XXX")
     #parser.add_argument("--division", metavar="bacteria|archaea", choices = ['bacteria', 'archaea'], type=str, default="bacteria", help="Analyze Bacteria or Archaea.")
-    #parser.add_argument("--rank", metavar="genus|family|order|class", choices = ['genus', 'family', 'order', 'class'], type=str, default="order", help="Extract trees for all taxa of this rank.")
-    parser.add_argument("--taxon", metavar="NNNN", type=int, help="Single taxon to extract.")
-    parser.add_argument("--taxon_set_file", metavar="file", type=str, help="File with list of taxon IDs for extraction.")
-    parser.add_argument("--target_ranks", metavar="rank1,rank2", type=str, default='genus,family,order,class,phylum' help="Comma-separated list of ranks to extract.")
+    parser.add_argument("--target_taxon", metavar="name or ID", type=str, help="Extract this one taxon.")
+    parser.add_argument("--target_taxon_file", metavar="file", type=str, help="File with list of taxon IDs for extraction.")
+    parser.add_argument("--encompassing_taxon", metavar="name or ID", type=str, help="Consider extracting only subtaxa of this.")
+    parser.add_argument("--ranks", metavar="rank1 [rank2 ...]", nargs='*', type=str, default=['genus', 'family', 'order', 'class', 'phylum'], help=" List of ranks to extract.")
     #parser.add_argument("--all_taxa", action='store_true', help="Generate trees for all taxa
     #parser.add_argument("--target_tree_size", metavar="NUM", type=int, default=20, help="Target number of tips on tree.")
-    parser.add_argument("--min_taxon_size", metavar="NUM", type=int, default=10, help="Minimum size of taxon.")
-    parser.add_argument("--max_taxon_size", metavar="NUM", type=int, default=1000, help="Maximum size of taxon.")
+    parser.add_argument("--min_taxon_size", metavar="NUM", type=int, default=0, help="Minimum size of taxon.")
+    parser.add_argument("--max_taxon_size", metavar="NUM", type=int, default=0, help="Maximum size of taxon (0=no limit).")
     parser.add_argument("--num_ancestral_nodes", metavar="NUM", type=int, default=2, help="How many nodes to step down to find outgroups.")
     parser.add_argument("--outgroups_per_anc_node", metavar="NUM", type=int, default=2,help="How many outgroup tips to select from each ancestral node.")
 
@@ -338,7 +380,7 @@ def main():
     #starttime = time()
 
     if args.download_latest_gtdb_release:
-        args.gtdb_data_dir = download_latest_gtdb_data(gtdb_base_url)
+        args.gtdb_data_dir = download_latest_gtdb_data(args.gtdb_data_url)
         args.link_bvbrc_gtdb_ids = True
 
     if not args.gtdb_data_dir:
@@ -359,175 +401,106 @@ def main():
     test_data_integrity(args.gtdb_data_dir)
 
     gtdb_bvbrc, genome_division = read_gtdb_bvbrc(args.gtdb_data_dir)
-    taxon_genomes, taxon_division, taxon_level = read_bvbrc_taxonomy(args.gtdb_data_dir)
+    taxon_genomes, taxon_subtaxa, taxon_parent = read_bvbrc_taxonomy(args.gtdb_data_dir)
 
     division_tree = {}
     division_genomes = {}
     division_tree_file = {"Bacteria": 'bac120.tree', "Archaea": 'ar53.tree', '2': 'bac120.tree', '2157': 'ar53.tree'}
     taxon_set = set()
-    if args.taxon:
-        taxon_set.add(args.taxon)
-    if args.taxon_set_file:
-        print("reading taxa IDs from "+args.taxon_set_file)
-        with open(args.taxon_set_file) as F:
-            for line in F:
-                taxon_id = line.split()[0]
-                m = re.match('\d+$', taxon_id)
-                taxon_set.add(taxon_id)
+    taxon_name = None;
+    taxon_rank = None;
+    if (args.target_taxon or args.target_taxon_file):
+        if args.target_taxon:
+            if not args.target_taxon in taxon_parent:
+                raise Exception(f"specified target taxon {args.target_taxon} not found.")
+            taxon_set.add(args.target_taxon)
+        if args.target_taxon_file:
+            print("reading taxa IDs from "+args.target_taxon_file)
+            with open(args.target_taxon_file) as F:
+                for line in F:
+                    taxon_id = line.split()[0]
+                    if not args.target_taxon in taxon_parent:
+                        raise Exception(f"specified target taxon {taxon_id} from file {args.target_taxon_file} not found.")
+                    taxon_set.add(taxon_id)
+        taxon_name, taxon_rank = get_taxon_name_rank(taxon_set)
+    
+    else:
+        if args.encompassing_taxon:
+            if not args.encompassing_taxon in taxon_subtaxa:
+                raise Exception(f"specified encompassing taxon {args.encompassing_taxon} not found.")
+            taxon_set.update(taxon_subtaxa[args.encompassing_taxon])
+            print(f"after restricting to descendant taxa of {args.encompassing_taxon}, num in taxon_set = {len(taxon_set)}")
 
-    print(f"after reading input sets: num in taxon_set = {len(taxon_set)}")
-    if len(taxon_set) == 0:
-        taxon_set = set(taxon_genomes.keys())
-        print(f"after adding all taxa, num in taxon_set = {len(taxon_set)}")
+        else:
+            taxon_set = set(taxon_genomes.keys())
+            print(f"after adding all taxa, num in taxon_set = {len(taxon_set)}")
 
-    taxon_set = filter_taxon_size(taxon_genomes, taxon_set, min_size=9, max_size=13)
-    print(f"after filter taxon size: num in taxon_set = {len(taxon_set)}")
-    taxon_name, taxon_rank = get_taxon_name_rank(taxon_set)
-    taxon_set = filter_taxon_name(taxon_name, taxon_set)
-    taxon_set = filter_taxon_rank(taxon_rank, args.target_ranks, taxon_set)
-    print(f"after filter taxon name: num in taxon_set = {len(taxon_set)}")
+        taxon_set = filter_taxon_size(taxon_genomes, taxon_set, min_size=args.min_taxon_size, max_size=args.max_taxon_size)
+        print(f"after filter taxon size: num in taxon_set = {len(taxon_set)}")
+        taxon_name, taxon_rank = get_taxon_name_rank(taxon_set)
+        taxon_set = filter_taxon_name(taxon_name, taxon_set)
+        print(f"after filter taxon name: num in taxon_set = {len(taxon_set)}")
+        taxon_set = filter_taxon_rank(taxon_rank, args.ranks, taxon_set)
+        print(f"after filter taxon rank: num in taxon_set = {len(taxon_set)}")
 
     newick_directory = args.gtdb_data_dir + "/newick_trees"
     if not os.path.exists(newick_directory):
         os.mkdir(newick_directory)
+    phyloxml_directory = args.gtdb_data_dir + "/phyloxml_trees"
+    if not os.path.exists(phyloxml_directory):
+        os.mkdir(phyloxml_directory)
+    taxon_tree_file = {}
     for taxon in taxon_set:
-        division = taxon_division[taxon]
+        division = None
+        if taxon in taxon_subtaxa['2']:
+            division = '2'
+        elif taxon in taxon_subtaxa['2157']:
+            division = '2157'
         if not division in division_tree:
             tree_file = args.gtdb_data_dir + "/" + division_tree_file[division]
             division_tree[division], division_genomes[division] = read_gtdb_tree(tree_file, gtdb_bvbrc)
         tree = division_tree[division]
-        available_tree_tips = taxon_genomes[taxon] & division_genomes[division]
-        if len(available_tree_tips) < len(taxon_genomes[taxon]):
-            print(f"for taxon{taxon} only {len(available_tree_tips)} of {len(taxon_genomes[taxon])} tips available")
+        tree_genomes = division_genomes[division]
+        available_tree_tips = (taxon_genomes[taxon] & tree_genomes)
+        #if len(available_tree_tips) < len(taxon_genomes[taxon]):
+        print(f"for taxon {taxon}, {taxon_name[taxon]} {len(available_tree_tips)} of {len(taxon_genomes[taxon])} tips available")
         subtree = extract_subtree(tree, available_tree_tips,num_outgroups_per_ancestral_node=args.outgroups_per_anc_node, num_ancestral_nodes=args.num_ancestral_nodes)
-        tree_file = f"{newick_directory}/taxon_{taxon}_gtdb_subtree_og{args.num_ancestral_nodes}x{args.outgroups_per_anc_node}.nwk"
-        with open(tree_file, 'w') as F:
+        rank = taxon_rank[taxon]
+        name = taxon_name[taxon].replace(' ', '_')
+        name = name.replace('(', '-')
+        name = name.replace(')', '-')
+        newick_file = f"taxon_{taxon}_{rank}_{name}_gtdb_subtree.nwk"
+        print(f"save tree as {newick_file}")
+        with open(f"{newick_directory}/{newick_file}", 'w') as F:
             subtree.write(file=F, schema="newick", suppress_rooting=True)
+        # now run p3x-newick-to-phyloxml
+        phyloxml_file = newick_file[:-4]+".phyloxml"
+        cmd = f"p3x-newick-to-phyloxml -l genome_id "
+        cmd += " --genomefields genome_name"
+        if rank == 'genus':
+            cmd += ",species"
+        elif rank == 'family':
+            cmd += ",genus,species"
+        elif rank == 'order':
+            cmd += ",family,genus,species"
+        elif rank == 'class':
+            cmd += ",order,family,genus,species"
+        elif rank == 'phylum':
+            cmd += ",class,order,family,genus,species"
+        cmd += f" {newick_directory}/{newick_file}"
+        print("run "+cmd)
+        subprocess.run(cmd, shell=True)
+        if os.path.exists(f"{phyloxml_directory}/{phyloxml_file}"):
+            os.remove(f"{phyloxml_directory}/{phyloxml_file}")
+        print(f"move {newick_directory}/{phyloxml_file} {phyloxml_directory}")
+        shutil.move(f"{newick_directory}/{phyloxml_file}", f"{phyloxml_directory}")
+        taxon_tree_file[taxon] = phyloxml_file
+
+    # now write taxon-to-tree_file dict as json file
+    with open(args.gtdb_data_dir + "/taxon_tree_dict.json", 'w') as F:
+        F.write(json.dumps(taxon_tree_file, indent=2))
+        F.close()
+
 
 if __name__ == "__main__":
     main()
-
-"""
-    assembly_gtdb = {}
-    gtdb_taxonomy = {}
-    gtdb_ncbi_taxonomy = {}
-    gtdb_name = {}
-    with open(args.gtdb_metadata) as F:
-        header = F.readline().rstrip().split("\t")
-        if not (header[0] == 'accession' and header[15] == 'gtdb_representative' and header[54] == 'ncbi_genbank_assembly_accession' and header[16] == 'gtdb_taxonomy'):
-            raise Exception("headers not as expected")
-        for line in F:
-            fields = line.split("\t")
-            if (fields[15] != 't'):
-                continue # means this genome is not on tree
-            gtdb_id = fields[0].replace('_', ' ') # dendropy replaces underscores with spaces in node labels
-            gtdb_taxonomy[gtdb_id] = fields[16]
-            assembly_id = fields[54]
-            #ncbi_taxonomy = fields[78]
-            assembly_gtdb[assembly_id] = gtdb_id
-            if len(assembly_gtdb) < 15:
-                sys.stderr.write("{}\t{}\n".format(gtdb_id, assembly_id))
-    sys.stderr.write(" metadata read, num tree genomes = {}\n".format(len(gtdb_taxonomy)))
-
-    bvbrc_representative = set()
-    gtdb_bvbrc = {}
-    # use system call to p3_all_genomes to get links between bvbrc and gtdb
-    p3_all_genomes_command = ["p3-all-genomes", "-e", "kingdom,Bacteria", "-a", "assembly_accession"]
-    proc = subprocess.Popen(p3_all_genomes_command, universal_newlines=True, shell=False, stdout=subprocess.PIPE) #, stdout=LOG, stderr=LOG)
-
-    num_examined = 0
-    proc.stdout.readline() # header
-    for line in proc.stdout:
-        fields = line.rstrip().split("\t")
-        num_examined += 1
-        if num_examined < 15:
-            print(fields)
-        if len(fields) == 2:
-            (bvbrc_id, assembly_accession) = fields
-            if assembly_accession in assembly_gtdb:
-                gtdb_id = assembly_gtdb[assembly_accession]
-                gtdb_bvbrc[gtdb_id] = bvbrc_id
-
-    return_code = proc.wait()
-    if return_code:
-        raise Exception("p3-all-genomes returned {}\n".format(return_code))
-        
-    sys.stderr.write("got bvbrc assembly accessions, num matching gtdb = {}, out of {}\n".format(len(gtdb_bvbrc), num_examined))
-
-
-    bvbrc_quality = {}
-    bvbrc_reference = set()
-    bvbrc_name = {}
-    bvbrc_taxon = {}
-    IDS = open("bvbrc_ids_on_gtdb_tree.ids", 'w')
-    IDS.write("genome_id\n" + "\n".join(gtdb_bvbrc.values()) + "\n")
-    IDS.close()
-    sys.stderr.write("ids written to bvbrc_ids_on_gtdb_tree.ids\n")
-
-    p3_get_genome_data_command = ['p3-get-genome-data', '-i', 'bvbrc_ids_on_gtdb_tree.ids', '-a', 'genome_name,genome_quality,reference_genome,{}'.format(args.rank)]
-    proc = subprocess.Popen(p3_get_genome_data_command, universal_newlines=True, shell=False, stdout=subprocess.PIPE) #, stdout=LOG, stderr=LOG)
-    header = proc.stdout.readline() # header
-    sys.stderr.write("get-genome-data header="+header)
-    for line in proc.stdout:
-        fields = line.rstrip().split("\t")
-        if len(fields) < 5:
-            fields.extend(['', '', '', '', ''])
-        (bvbrc_id, genome_name, genome_quality, reference_genome, taxon) = fields[:5];
-        if len(bvbrc_name) < 5:
-            #sys.stderr.write(line)
-            sys.stderr.write(str(fields)+"\n")
-        bvbrc_name[bvbrc_id] = genome_name
-        bvbrc_quality[bvbrc_id] = genome_quality
-        bvbrc_taxon[bvbrc_id] = taxon
-        if reference_genome:
-            bvbrc_reference.add(bvbrc_id)
-    proc.wait()
-
-    sys.stderr.write("got bvbrc genome data, num matches = {}\n".format(len(bvbrc_name)))
-    sys.stderr.write("num representative = {}\n".format(len(bvbrc_reference)))
-
-    tree = None
-    with open(args.gtdb_tree) as F:
-        tree_str = F.read()
-        sys.stderr.write("length of tree string in {} is {}\n".format(args.gtdb_tree, len(tree_str)))
-        F.close()
-        tree = dendropy.Tree.get(
-                data=tree_str,
-                schema="newick")
-
-    taxon_gtdb_ids = {}
-    for gtdb_id in gtdb_bvbrc:
-        #if tree.find_node_with_taxon_label(gtdb_id):
-            bvbrc_id = gtdb_bvbrc[gtdb_id]
-            taxon = bvbrc_taxon[bvbrc_id]
-            if not taxon:
-                continue
-            if not taxon in taxon_gtdb_ids:
-                taxon_gtdb_ids[taxon] = set()
-            taxon_gtdb_ids[taxon].add(gtdb_id)
-
-    output_dir = "new_{}_trees".format(args.rank)
-    tree_base = "{}/{}_{}_a{}_o{}_".format(output_dir, "{}", args.rank, args.num_ancestral_nodes, args.outgroups_per_anc_node)
-    tree_base += os.path.basename(args.gtdb_tree)
-    sys.stderr.write("tree_base = "+tree_base+"\n")
-
-    taxa_to_extract = taxon_gtdb_ids.keys()
-    if args.taxon: # useful for debugging
-        taxa_to_extract = args.taxon.split(",")
-
-    for taxon in taxa_to_extract:
-        if not taxon:
-            continue
-        tip_ids = set()
-        for tip_id in taxon_gtdb_ids[taxon]:
-            if tree.find_node_with_taxon_label(tip_id):
-                tip_ids.add(tip_id)
-            else:
-                sys.stderr.write("    !! no tree node for '{}'\n".format(tip_id))
-                bvbrc_id = gtdb_bvbrc[tip_id]
-                if tree.find_node_with_taxon_label(bvbrc_id):
-                    raise Exception("tree does have node labeled {}\n".format(bvbrc_id))
-        sys.stderr.write("taxon {}, num {}\n".format(taxon, len(tip_ids)))
-        if not len(tip_ids):
-            continue
-            """
